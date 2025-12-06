@@ -20,31 +20,35 @@ P_MAX = 10.0
 SOC_START = 5.0 
 MIN_TRANZACTIE = 0.1 
 
-# Parametri LightGBM ajustați pentru REGULARIZARE sporită
-N_ESTIMATORS = 100 
+# Marjă de siguranță pentru capacitatea MILP
+SOC_MIN_MILP = 0.01
+SOC_MAX_MILP = C_MAX - 0.01
+
+
+# Parametri LightGBM ajustați pentru performanță maximă
+N_ESTIMATORS = 300 # Crescut pentru learning rate mic
 LGBM_PARAMS = {
     'objective': 'regression_l1',
     'metric': 'mae',
     'n_estimators': N_ESTIMATORS,
-    'learning_rate': 0.05,
-    'num_leaves': 64,
+    'learning_rate': 0.03,
+    'num_leaves': 128,
     'max_depth': 8,
     'subsample': 0.8,
     'colsample_bytree': 0.8,
-    'reg_alpha': 1.0,  # Crescut
-    'reg_lambda': 2.0,  # Crescut
-    'min_child_samples': 50,
+    'reg_alpha': 1.0,
+    'reg_lambda': 2.0,
+    'min_child_samples': 20,
     'n_jobs': -1,
     'verbose': -1,
     'seed': 42
 }
 
 # ==============================================================================
-# 1. PREGATIREA DATELOR ȘI FEATURE ENGINEERING (Lag-uri simplificate)
+# 1. PREGATIREA DATELOR ȘI FEATURE ENGINEERING (Noul Lag 48)
 # ==============================================================================
 
 def create_time_features(df):
-    """Extrage feature-uri de timp și lag-uri pe termen lung (stabil)."""
     
     if 'Start' not in df.columns:
         df['Start'] = pd.to_datetime(df['Time interval (CET/CEST)'].str.split(' - ').str[0], format="%d.%m.%Y %H:%M")
@@ -62,18 +66,14 @@ def create_time_features(df):
     df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7)
     df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7)
     
-    # Lag-uri de preț (folosim doar lag-urile pe termen lung)
+    # Lag-uri de preț (Lag 48 adăugat)
     if 'Price' in df.columns:
-        df['price_lag_96'] = df['Price'].shift(96)     # Prețul de acum o zi
-        df['price_lag_672'] = df['Price'].shift(672)   # Lag Săptămânal (96 * 7)
-        
-        # Medii mobile și STD sunt ELIMINATE pentru a stabiliza predicția iterativă
-        # df['rolling_mean_4h'] = df['Price'].rolling(window=16).mean().shift(1)
-        # df['rolling_std_24h'] = df['Price'].rolling(window=96).std().shift(1)
+        df['price_lag_96'] = df['Price'].shift(96)     # 1 zi
+        df['price_lag_48'] = df['Price'].shift(48)     # 12 ore
+        df['price_lag_672'] = df['Price'].shift(672)   # 7 zile
 
     return df.dropna().reset_index(drop=True)
 
-# 🛑 AICI ÎNCĂRCĂM DATELE TALE
 try:
     df_raw = pd.read_csv("Dataset.csv")
     df_raw = df_raw.sort_values(by='Time interval (CET/CEST)', key=lambda x: pd.to_datetime(x.str.split(' - ').str[0], format="%d.%m.%Y %H:%M")).reset_index(drop=True)
@@ -83,7 +83,7 @@ try:
     EXCLUDE_COLS = ['Time interval (CET/CEST)', 'Start', 'Price']
     FEATURE_COLS = [col for col in df_train.columns if col not in EXCLUDE_COLS]
     
-    # Determinăm cel mai mare lag necesar
+    # MAX_LAG devine 672
     MAX_LAG = 672 
 
     print("1. Date istorice încărcate și preprocesate.")
@@ -104,7 +104,7 @@ X_train, X_val = X.iloc[:-96], X.iloc[-96:]
 y_train, y_val = y.iloc[:-96], y.iloc[-96:]
 
 # 1. Antrenarea Modelului
-print("\n2. Antrenarea LightGBM (Regulărizată)...")
+print("\n2. Antrenarea LightGBM (Final Fine-Tuning)...")
 lgbm = lgb.LGBMRegressor(**LGBM_PARAMS)
 
 lgbm.fit(
@@ -128,7 +128,7 @@ df_pred['Time interval (CET/CEST)'] = df_pred['Start'].apply(lambda x: x.strftim
 df_pred_template = create_time_features(df_pred.copy())
 
 # Reinițializăm coloanele de lag
-for col in ['price_lag_96', 'price_lag_672']:
+for col in ['price_lag_96', 'price_lag_48', 'price_lag_672']:
     if col in FEATURE_COLS:
         df_pred_template[col] = 0.0
 
@@ -146,18 +146,18 @@ for i in tqdm(range(TOTAL_INTERVALS), desc="Predicting"):
     
     X_pred_row = X_pred_template.iloc[[i]].copy()
     
-    # Calculăm și aplicăm lag-urile dinamice:
-    
     # 24h Lag (96 de pași în urmă)
     lag_96_val = full_history[current_idx - 95] 
     X_pred_row.loc[X_pred_row.index[0], 'price_lag_96'] = lag_96_val
+    
+    # 12h Lag (48 de pași în urmă)
+    lag_48_val = full_history[current_idx - 47] 
+    X_pred_row.loc[X_pred_row.index[0], 'price_lag_48'] = lag_48_val
 
     # 7 Day Lag (672 de pași în urmă)
     lag_672_val = full_history[current_idx - 671] 
     X_pred_row.loc[X_pred_row.index[0], 'price_lag_672'] = lag_672_val
     
-    # Medii mobile și STD sunt excluse
-
     # Realizăm predicția
     pred_val = lgbm.predict(X_pred_row)[0]
     predicted_prices.append(pred_val)
@@ -176,8 +176,9 @@ def solve_daily_milp(day_prices):
     T = INTERVALS_PER_DAY
     prob = pulp.LpProblem("Battery_Trading_Optimization_MILP", pulp.LpMaximize)
     
+    # Variabile de decizie (SoC limite ajustate)
     position = pulp.LpVariable.dicts("Position", range(1, T + 1), lowBound=-P_MAX, upBound=P_MAX)
-    soc = pulp.LpVariable.dicts("SoC", range(1, T + 1), lowBound=0, upBound=C_MAX)
+    soc = pulp.LpVariable.dicts("SoC", range(1, T + 1), lowBound=SOC_MIN_MILP, upBound=SOC_MAX_MILP)
     surplus = pulp.LpVariable("Surplus", lowBound=0, upBound=C_MAX)
     
     charge = pulp.LpVariable.dicts("Charge", range(1, T + 1), cat='Binary')
