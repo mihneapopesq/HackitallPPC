@@ -1,6 +1,6 @@
 # Energy Trading Hackathon
 
-This repository contains the environment where you will develop your trading strategy for the hackathon.
+This repository contains the environment where the trading strategy for the hackathon was implemented. 
 
 ## Problem Overview
 
